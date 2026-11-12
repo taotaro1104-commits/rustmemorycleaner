@@ -219,4 +219,91 @@ mod tests {
         let _ = stop.send(true);
         let _ = h.await;
     }
+
+    fn running_elevated() -> bool {
+        memopt_cleaner::is_elevated()
+    }
+
+    /// 標準ユーザー（このテストが非昇格で動くとき）は、サービスや他ユーザーのプロセスに対する操作を拒否される。
+    /// 管理者で動かすとこの前提が成り立たないので、その場合は検証を省く（verify-admin.ps1 が管理者側を確認する）。
+    #[tokio::test]
+    async fn a_standard_user_cannot_stop_services_or_touch_other_users_processes() {
+        if running_elevated() {
+            return;
+        }
+        use memopt_core::stop::StopMethod;
+        use memopt_core::SafetyClass;
+        let (stop, h, pipe, _dir) = start("authz").await;
+        let mut c = Client::connect(&pipe).unwrap();
+        let t = Duration::from_secs(40);
+        let Msg::Features { features } = c.call(Msg::GetFeatures, t).await.unwrap() else { panic!() };
+
+        // 1) サービス: 計画では選択肢が「使えない」になり、実行も拒否される（管理者のみ）。
+        let svc = features.iter().find(|f| f.id == "svc:WSearch" && f.safety != SafetyClass::Protected);
+        if let Some(svc) = svc {
+            let Msg::Plan { plan } = c.call(Msg::PlanStop { feature_id: svc.id.clone() }, t).await.unwrap() else { panic!() };
+            let stop_opt = plan.options.iter().find(|o| o.method == StopMethod::ServiceStop).expect("選択肢は載る");
+            assert!(!stop_opt.available && stop_opt.note.as_deref().is_some_and(|n| n.contains("管理者")), "{stop_opt:?}");
+            for m in [StopMethod::ServiceStop, StopMethod::ServiceStartupDisabled, StopMethod::ServiceStartupManual] {
+                let r = c.call(Msg::StopFeature { feature_id: svc.id.clone(), method: m, target: Some("WSearch".into()), confirmed: true }, t).await.unwrap();
+                assert!(matches!(r, Msg::Error { ref code, ref message } if code == "denied" && message.contains("管理者")), "{m:?}: {r:?}");
+            }
+        }
+
+        // 2) 他のユーザー/システムのプロセスを含む機能: 害の小さい「優先度を下げる」でも拒否される。
+        let me = memopt_probe::process_owner_sid(std::process::id()).expect("自分の SID");
+        let foreign = features.iter().find(|f| {
+            f.safety != SafetyClass::Protected
+                && f.kind == memopt_core::FeatureKind::DesktopApp
+                && f.pids.first().and_then(|p| memopt_probe::process_owner_sid(*p)).is_some_and(|o| o != me)
+        });
+        if let Some(f) = foreign {
+            let Msg::Plan { plan } = c.call(Msg::PlanStop { feature_id: f.id.clone() }, t).await.unwrap() else { panic!() };
+            assert!(plan.options.iter().all(|o| !o.available), "他人のプロセスの選択肢はすべて使えない: {:?}", plan.options);
+            let r = c.call(Msg::StopFeature { feature_id: f.id.clone(), method: StopMethod::LowerPriority, target: None, confirmed: false }, t).await.unwrap();
+            assert!(matches!(r, Msg::Error { ref code, .. } if code == "denied"), "{r:?}");
+        }
+        assert!(svc.is_some() || foreign.is_some(), "検証対象が 1 つも見つからない");
+        let _ = stop.send(true);
+        let _ = h.await;
+    }
+
+    #[tokio::test]
+    async fn a_standard_user_sees_and_undoes_only_their_own_journal_entries() {
+        use memopt_core::stop::{Change, JournalEntry, Outcome, StopMethod};
+        let (stop, h, pipe, dir) = start("journalauthz").await;
+        let me = memopt_probe::process_owner_sid(std::process::id()).expect("自分の SID");
+        // 他のユーザー（別 SID）が行った操作と、自分が行った操作をジャーナルに直接用意する。
+        let j = memopt_actions::journal::Journal::open(&dir.join("journal.jsonl"));
+        let mk = |id: u64, actor: &str| JournalEntry {
+            id, ts_unix: 0, feature_id: "f".into(), feature_name: format!("F{id}"), method: StopMethod::LowerPriority, target: None,
+            change: Change::MemoryPriority { items: vec![] }, outcome: Outcome::Ok, avail_before: None, avail_after: None,
+            undone_ts: None, actor_sid: Some(actor.into()),
+        };
+        j.append_entry(&mk(1, "S-1-5-21-0-0-0-9999")).unwrap();
+        j.append_entry(&mk(2, &me)).unwrap();
+        let mut c = Client::connect(&pipe).unwrap();
+        let t = Duration::from_secs(10);
+        let Msg::Journal { entries } = c.call(Msg::GetJournal { limit: 50 }, t).await.unwrap() else { panic!() };
+        let ids: Vec<u64> = entries.iter().map(|e| e.id).collect();
+        if running_elevated() {
+            assert_eq!(ids, vec![2, 1], "管理者は全員分を見られる");
+            let _ = stop.send(true);
+            let _ = h.await;
+            return;
+        }
+        assert_eq!(ids, vec![2], "標準ユーザーは自分の分だけ");
+        // 他人の分は戻せない。自分の分は戻せる。
+        let r = c.call(Msg::Undo { journal_id: 1 }, t).await.unwrap();
+        assert!(matches!(r, Msg::Error { ref code, .. } if code == "undo_failed"), "{r:?}");
+        assert_eq!(c.call(Msg::Undo { journal_id: 2 }, t).await.unwrap(), Msg::Ack);
+        // 一括復元も、他人の分は残す。
+        let Msg::UndoDone { restored, failed } = c.call(Msg::UndoAll, t).await.unwrap() else { panic!() };
+        assert!(restored.is_empty() && failed.is_empty(), "{restored:?} {failed:?}");
+        let after = memopt_actions::journal::Journal::open(&dir.join("journal.jsonl")).load();
+        assert_eq!(after.iter().find(|e| e.id == 1).unwrap().undone_ts, None);
+        assert!(after.iter().find(|e| e.id == 2).unwrap().undone_ts.is_some());
+        let _ = stop.send(true);
+        let _ = h.await;
+    }
 }

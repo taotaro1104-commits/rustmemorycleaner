@@ -1,4 +1,5 @@
 //! 評価ループ（設計書3章）: 既定 15 秒ごとにスナップショット → トリガー判定 → 実行/抑止の記録。
+use crate::sync::{LockExt, RwLockExt};
 use crate::loadring::Sample;
 use crate::runner::RunRequest;
 use crate::state::{Shared, CPU_HISTORY};
@@ -19,16 +20,16 @@ const SELF_TRIM_EVERY: u64 = 4;
 
 pub fn build_input(shared: &Shared, tick: u64) -> Option<Input> {
     let mem = memopt_probe::memory_snapshot()?;
-    *shared.mem.lock().unwrap() = Some(mem);
+    *shared.mem.lock_ok() = Some(mem);
     let now = shared.now_secs();
 
     // 負荷サンプル（ハードフォルト・ディスク）をリングに積む。
     {
-        let pdh = shared.pdh.lock().unwrap();
+        let pdh = shared.pdh.lock_ok();
         if let Some(p) = pdh.as_ref() {
             p.collect();
             if let Some(load) = p.load() {
-                shared.loads.lock().unwrap().push(Sample { t: now, load, disk_busy_pct: p.disk_busy_pct() });
+                shared.loads.lock_ok().push(Sample { t: now, load, disk_busy_pct: p.disk_busy_pct() });
             }
         }
     }
@@ -36,7 +37,7 @@ pub fn build_input(shared: &Shared, tick: u64) -> Option<Input> {
         record_cpu_times(shared);
     }
 
-    let cfg = shared.cfg.read().unwrap().clone();
+    let cfg = shared.cfg.read_ok().clone();
     let session = shared.fresh_session();
     let (minute, hour, day, month, weekday) = memopt_probe::local_time_parts();
     let unix_min = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() / 60).unwrap_or(0);
@@ -49,7 +50,7 @@ pub fn build_input(shared: &Shared, tick: u64) -> Option<Input> {
         user_idle_secs: session.as_ref().map(|s| s.user_idle_secs),
         fullscreen: session.as_ref().is_some_and(|s| s.fullscreen),
         // 直近 30 秒（15 秒間隔で 2 点）の平均で判定する。
-        disk_busy_pct: shared.loads.lock().unwrap().avg_disk_busy(now, 30),
+        disk_busy_pct: shared.loads.lock_ok().avg_disk_busy(now, 30),
         battery_saver: memopt_probe::battery_saver_on() || session.as_ref().is_some_and(|s| s.battery_saver),
         low_memory_signal: shared.low_mem.as_ref().is_some_and(|w| w.is_low()),
         schedule_due: due_schedule(&cfg.auto_clean.schedule, moment, unix_min),
@@ -61,7 +62,7 @@ pub fn build_input(shared: &Shared, tick: u64) -> Option<Input> {
 fn record_cpu_times(shared: &Shared) {
     // 全プロセスの CPU 時間を 1 回のシステム呼び出しで取る（ハンドルを開かないので常駐でも軽い）。
     let times = memopt_probe::all_cpu_times();
-    let mut h = shared.cpu_hist.lock().unwrap();
+    let mut h = shared.cpu_hist.lock_ok();
     h.push_back((Instant::now(), times));
     while h.len() > CPU_HISTORY {
         h.pop_front();
@@ -94,7 +95,7 @@ pub fn apply_decision(
 }
 
 fn pressure_now(shared: &Shared, input: &Input) -> bool {
-    let p = &shared.cfg.read().unwrap().auto_clean.pressure;
+    let p = &shared.cfg.read_ok().auto_clean.pressure;
     input.mem.avail_pct() < p.available_below_pct || input.mem.commit_pct() > p.commit_above_pct
 }
 
@@ -107,7 +108,7 @@ pub async fn eval_loop(
     let mut last_skip = None;
     let mut tick: u64 = 0;
     loop {
-        let secs = shared.cfg.read().unwrap().monitor.eval_interval_sec;
+        let secs = shared.cfg.read_ok().monitor.eval_interval_sec;
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(secs)) => {}
             _ = stop.changed() => { if *stop.borrow() { return; } }
@@ -121,7 +122,7 @@ pub async fn eval_loop(
         if shared.pressure_active.swap(now_pressure, Ordering::SeqCst) != now_pressure {
             let _ = notify.send(Frame::new(None, Msg::PressureChanged { active: now_pressure }));
         }
-        let decision = shared.engine.lock().unwrap().evaluate(&input);
+        let decision = shared.engine.lock_ok().evaluate(&input);
         apply_decision(decision, &run_tx, &notify, &mut last_skip);
         // 自分自身のワーキングセットも整理する（設計書3章: 常駐メモリ目標のため、解放対象から除外しない）。
         if tick % SELF_TRIM_EVERY == 0 {

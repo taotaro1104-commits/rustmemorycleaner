@@ -1,5 +1,6 @@
 //! 停止要求の解決: 最新のプロセス一覧から機能を引き直し、停止対象と安全分類（実行時判定）を求める。
 //! パイプ越しの要求は信用せず、ここで必ずサービス側が再照合する（設計書6章）。
+use crate::sync::{LockExt, RwLockExt};
 use crate::state::{Shared, TASKS_TTL_SECS};
 use memopt_actions::plan::{build_plan, quick_safety, Facts, ServiceFacts, SERVICE_AUTO};
 use memopt_actions::{svc, task};
@@ -18,7 +19,7 @@ fn same_path(a: &str, b: &str) -> bool {
 }
 
 fn cached_tasks(shared: &Shared) -> Vec<task::TaskInfo> {
-    let mut g = shared.tasks.lock().unwrap();
+    let mut g = shared.tasks.lock_ok();
     if let Some((at, v)) = g.as_ref() {
         if at.elapsed() < Duration::from_secs(TASKS_TTL_SECS) {
             return v.clone();
@@ -61,7 +62,7 @@ pub fn list_features(shared: &Shared) -> Vec<Feature> {
     let procs = memopt_probe::processes();
     let mut features = memopt_grouping::group(&procs);
     memopt_grouping::mark_startup(&mut features, &procs, &memopt_probe::startup_entries());
-    let user = shared.cfg.read().unwrap().protect.user_paths.clone();
+    let user = shared.cfg.read_ok().protect.user_paths.clone();
     for f in features.iter_mut() {
         let fp: Vec<&ProcessInfo> = procs.iter().filter(|p| f.pids.contains(&p.pid)).collect();
         f.safety = quick_safety(f, &fp, &user);
@@ -78,7 +79,7 @@ pub fn resolve(shared: &Shared, feature_id: &str) -> Result<Resolved, String> {
         .ok_or("機能が見つかりません（すでに終了した可能性があります）")?;
     let fprocs: Vec<&ProcessInfo> = procs.iter().filter(|p| feature.pids.contains(&p.pid)).collect();
     feature.targets = targets_for(&fprocs, shared);
-    let user = shared.cfg.read().unwrap().protect.user_paths.clone();
+    let user = shared.cfg.read_ok().protect.user_paths.clone();
     // 照会できないサービス（権限不足など）は「停止要求を受け付けない」として扱い、安全側（保護）に倒す。
     let services: Vec<ServiceFacts> = feature
         .targets

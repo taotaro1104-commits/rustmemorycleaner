@@ -147,6 +147,36 @@ pub fn all_cpu_times() -> HashMap<u32, u64> {
     nt_process_table().into_iter().map(|(pid, p)| (pid, p.cpu_time)).collect()
 }
 
+/// プロセスの所有者（ユーザー SID の文字列）。開けない/取れない場合は None。
+/// 停止の認可（標準ユーザーは自分のプロセスだけ）に使うので、取れないものは「他人のもの」として扱われる。
+pub fn process_owner_sid(pid: u32) -> Option<String> {
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut tok = HANDLE::default();
+        let opened = OpenProcessToken(h, TOKEN_QUERY, &mut tok).is_ok();
+        let _ = CloseHandle(h);
+        if !opened {
+            return None;
+        }
+        let mut need = 0u32;
+        let _ = GetTokenInformation(tok, TokenUser, None, 0, &mut need);
+        let mut buf = vec![0u8; need.max(1) as usize];
+        let r = GetTokenInformation(tok, TokenUser, Some(buf.as_mut_ptr() as *mut _), need, &mut need).ok().and_then(|_| {
+            let mut s = PWSTR::null();
+            ConvertSidToStringSidW((*(buf.as_ptr() as *const TOKEN_USER)).User.Sid, &mut s).ok()?;
+            let out = s.to_string().ok();
+            let _ = LocalFree(HLOCAL(s.0 as *mut _));
+            out
+        });
+        let _ = CloseHandle(tok);
+        r
+    }
+}
+
 fn session_of(pid: u32) -> u32 {
     let mut sid = 0u32;
     unsafe { windows::Win32::System::RemoteDesktop::ProcessIdToSessionId(pid, &mut sid).map(|_| sid).unwrap_or(0) }
@@ -227,6 +257,18 @@ mod tests {
         let close = |a: u64, b: u64, tol: f64| (a as f64 - b as f64).abs() <= b as f64 * tol;
         assert!(close(m.commit_limit, limit, 0.02), "limit {} vs {}", m.commit_limit, limit);
         assert!(close(m.commit_total, total, 0.05), "total {} vs {}", m.commit_total, total);
+    }
+
+    #[test]
+    fn process_owner_is_the_current_user_for_self_and_for_a_child() {
+        let me = process_owner_sid(std::process::id()).expect("self owner");
+        assert!(me.starts_with("S-1-5-"), "{me}");
+        let mut c = std::process::Command::new("ping").args(["-n", "20", "127.0.0.1"]).stdout(std::process::Stdio::null()).spawn().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(process_owner_sid(c.id()).as_deref(), Some(me.as_str()));
+        let _ = c.kill();
+        // 存在しない PID は None（所有者不明 = 他人扱い）
+        assert_eq!(process_owner_sid(u32::MAX - 7), None);
     }
 
     #[test]

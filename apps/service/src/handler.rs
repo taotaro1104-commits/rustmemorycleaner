@@ -1,10 +1,12 @@
 //! IPC 要求のハンドラ。パイプ越しの内容はここで必ず再検証する（設計書6章）。
+use crate::sync::{LockExt, RwLockExt};
 use crate::runner::RunRequest;
 use crate::state::{Shared, FEATURES_TTL_SECS, MAX_PAUSE_SECS};
 use crate::config_io;
 use memopt_core::ipc::{Msg, RunSummary};
 use memopt_core::Trigger;
-use memopt_ipc::{BoxFut, Handler};
+use memopt_actions::plan::CallerInfo;
+use memopt_ipc::{BoxFut, Caller, Handler};
 use memopt_store::RunRecord;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -43,16 +45,16 @@ pub fn summarize(r: &RunRecord) -> RunSummary {
 impl ServiceHandler {
     fn snapshot(&self) -> Msg {
         let s = &self.shared;
-        let mem = memopt_probe::memory_snapshot().or(*s.mem.lock().unwrap()).unwrap_or_default();
+        let mem = memopt_probe::memory_snapshot().or(*s.mem.lock_ok()).unwrap_or_default();
         // エンジンのロックは 1 回だけ取る。同じ式の中で 2 回 lock() すると、最初のガードが式の終わりまで
         // 生きているためデッドロックする（std の Mutex は再入不可）。
         let (emergency_stop, adaptive) = {
-            let mut e = s.engine.lock().unwrap();
+            let mut e = s.engine.lock_ok();
             (e.emergency_stopped(), e.adaptive_notes(s.now_secs()))
         };
         Msg::Snapshot {
             mem,
-            auto_enabled: s.cfg.read().unwrap().auto_clean.enabled,
+            auto_enabled: s.cfg.read_ok().auto_clean.enabled,
             paused: s.is_paused(),
             emergency_stop,
             adaptive,
@@ -61,7 +63,7 @@ impl ServiceHandler {
 
     async fn features(&self) -> Msg {
         {
-            let g = self.shared.features.lock().unwrap();
+            let g = self.shared.features.lock_ok();
             if let Some((at, f)) = g.as_ref() {
                 if at.elapsed().as_secs() < FEATURES_TTL_SECS {
                     return Msg::Features { features: f.clone() };
@@ -73,7 +75,7 @@ impl ServiceHandler {
         let f = tokio::task::spawn_blocking(move || crate::stopsvc::list_features(&sh)).await;
         match f {
             Ok(features) => {
-                *self.shared.features.lock().unwrap() = Some((Instant::now(), features.clone()));
+                *self.shared.features.lock_ok() = Some((Instant::now(), features.clone()));
                 Msg::Features { features }
             }
             Err(e) => err("internal", e.to_string()),
@@ -93,27 +95,27 @@ impl ServiceHandler {
     fn update_config(&self, text: &str) -> Msg {
         match config_io::apply_update(&self.shared.config_path, text) {
             Ok((cfg, warnings)) => {
-                self.shared.engine.lock().unwrap().update_config(&cfg);
+                self.shared.engine.lock_ok().update_config(&cfg);
                 let toml = toml::to_string_pretty(&cfg).unwrap_or_default();
-                *self.shared.cfg.write().unwrap() = cfg;
+                *self.shared.cfg.write_ok() = cfg;
                 Msg::Config { toml, warnings }
             }
             Err(e) => err("bad_config", e),
         }
     }
 
-    async fn dispatch(&self, req: Msg) -> Msg {
+    async fn dispatch(&self, req: Msg, caller: &CallerInfo) -> Msg {
         match req {
             Msg::GetSnapshot => self.snapshot(),
             Msg::GetFeatures => self.features().await,
-            Msg::GetHistory { limit } => match self.shared.store.lock().unwrap().list_runs(limit.clamp(1, MAX_HISTORY) as usize) {
+            Msg::GetHistory { limit } => match self.shared.store.lock_ok().list_runs(limit.clamp(1, MAX_HISTORY) as usize) {
                 Ok(v) => Msg::History { runs: v.iter().map(summarize).collect() },
                 Err(e) => err("internal", e.to_string()),
             },
             Msg::RunClean { level } => self.run_clean(level),
             Msg::ReportSession(mut s) => {
                 s.audio_pids.truncate(MAX_AUDIO_PIDS);
-                *self.shared.session.lock().unwrap() = Some((s, Instant::now()));
+                *self.shared.session.lock_ok() = Some((s, Instant::now()));
                 Msg::Ack
             }
             Msg::SetPaused { secs } => {
@@ -121,23 +123,23 @@ impl ServiceHandler {
                 Msg::Ack
             }
             Msg::EmergencyStop { on } => {
-                self.shared.engine.lock().unwrap().set_emergency_stop(on);
+                self.shared.engine.lock_ok().set_emergency_stop(on);
                 tracing::warn!("緊急停止 {}", if on { "ON" } else { "OFF" });
                 Msg::Ack
             }
             Msg::GetConfig => {
-                let cfg = self.shared.cfg.read().unwrap().clone();
+                let cfg = self.shared.cfg.read_ok().clone();
                 Msg::Config { toml: toml::to_string_pretty(&cfg).unwrap_or_default(), warnings: vec![] }
             }
             Msg::UpdateConfig { toml } => self.update_config(&toml),
-            Msg::PlanStop { feature_id } => self.plan_stop(feature_id).await,
-            Msg::StopFeature { feature_id, method, target, confirmed } => self.stop_feature(feature_id, method, target, confirmed).await,
-            Msg::FinishGraceful { journal_id, ok } => self.finish_graceful(journal_id, ok),
-            Msg::Undo { journal_id } => self.undo(journal_id).await,
-            Msg::UndoAll => self.undo_all().await,
-            Msg::GetJournal { limit } => self.get_journal(limit),
+            Msg::PlanStop { feature_id } => self.plan_stop(feature_id, caller).await,
+            Msg::StopFeature { feature_id, method, target, confirmed } => self.stop_feature(feature_id, method, target, confirmed, caller).await,
+            Msg::FinishGraceful { journal_id, ok } => self.finish_graceful(journal_id, ok, caller),
+            Msg::Undo { journal_id } => self.undo(journal_id, caller).await,
+            Msg::UndoAll => self.undo_all(caller).await,
+            Msg::GetJournal { limit } => self.get_journal(limit, caller),
             Msg::ResetAdaptive => {
-                self.shared.engine.lock().unwrap().reset_adaptive();
+                self.shared.engine.lock_ok().reset_adaptive();
                 tracing::info!("自動調整を手動で解除しました");
                 Msg::Ack
             }
@@ -158,9 +160,11 @@ impl ServiceHandler {
 }
 
 impl Handler for ServiceHandler {
-    fn handle(&self, req: Msg) -> BoxFut {
+    fn handle(&self, req: Msg, caller: &Caller) -> BoxFut {
         // dispatch は &self を借りるので、必要な Arc を複製して 'static にする。
         let me = ServiceHandler { shared: self.shared.clone(), run_tx: self.run_tx.clone(), notify: self.notify_clone() };
-        Box::pin(async move { me.dispatch(req).await })
+        // OS が保証する接続元の身元。要求の内容には書かせない。
+        let who = CallerInfo { is_admin: caller.is_admin, user_sid: caller.user_sid.clone() };
+        Box::pin(async move { me.dispatch(req, &who).await })
     }
 }

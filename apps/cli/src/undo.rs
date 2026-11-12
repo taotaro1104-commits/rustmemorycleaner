@@ -112,7 +112,7 @@ mod tests {
     fn entry(outcome: Outcome, change: Change, undone: Option<i64>) -> JournalEntry {
         JournalEntry {
             id: 3, ts_unix: 0, feature_id: "f".into(), feature_name: "Search".into(), method: StopMethod::ServiceStartupDisabled,
-            target: Some("WSearch".into()), change, outcome, avail_before: None, avail_after: None, undone_ts: undone,
+            target: Some("WSearch".into()), change, outcome, avail_before: None, avail_after: None, undone_ts: undone, actor_sid: None,
         }
     }
 

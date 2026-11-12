@@ -145,8 +145,17 @@ pub fn build_plan(f: &Facts) -> StopPlan {
     }
 }
 
+/// パイプの接続元の身元（OS が保証する値）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CallerInfo {
+    pub is_admin: bool,
+    pub user_sid: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Deny {
+    /// 呼び出し元の権限が足りない（管理者でないと実行できない操作）。
+    NeedsAdmin(String),
     Protected,
     NotOffered,
     Unavailable(String),
@@ -157,6 +166,7 @@ pub enum Deny {
 impl Deny {
     pub fn text(&self) -> String {
         match self {
+            Self::NeedsAdmin(why) => format!("管理者権限が必要です: {why}"),
             Self::Protected => "保護対象のため停止できません".into(),
             Self::NotOffered => "この機能では使えない手段です".into(),
             Self::Unavailable(n) => format!("現在は実行できません: {n}"),
@@ -191,6 +201,58 @@ pub fn authorize<'a>(plan: &'a StopPlan, method: StopMethod, target: Option<&str
         return Err(Deny::NeedsConfirmation);
     }
     Ok(o)
+}
+
+/// 呼び出し元の権限で、その手段を実行してよいか。計画の認可（`authorize`）とは別に、必ず両方を通すこと。
+///
+/// 管理者（昇格済み）はすべて可。標準ユーザーは「自分のものだけ」:
+/// - 正常終了 / 強制終了 / 優先度: 影響するプロセスがすべて自分のユーザーのもの（所有者が不明なら不可）
+/// - スタートアップ無効化: 自分の HKU 配下の項目だけ（HKLM = マシン全体は不可）
+/// - サービスの停止・種別変更、タスクの無効化: 不可（SYSTEM の権限で他人に影響するため）
+pub fn authorize_caller(
+    method: StopMethod,
+    target: Option<&str>,
+    feature: &Feature,
+    owner_of: &dyn Fn(u32) -> Option<String>,
+    affected_pids: &[u32],
+    caller: &CallerInfo,
+) -> Result<(), Deny> {
+    if caller.is_admin {
+        return Ok(());
+    }
+    let me = caller.user_sid.as_deref();
+    match method {
+        StopMethod::ServiceStop | StopMethod::ServiceStartupManual | StopMethod::ServiceStartupDisabled | StopMethod::DisableTask => {
+            Err(Deny::NeedsAdmin("サービスやスケジュールタスクの変更は管理者のみ可能です".into()))
+        }
+        StopMethod::DisableStartup => {
+            let mine = target
+                .and_then(|t| feature.targets.startup.iter().find(|s| s.name == t))
+                .is_some_and(|s| me.is_some() && s.user_sid.as_deref() == me);
+            if mine { Ok(()) } else { Err(Deny::NeedsAdmin("自分以外（またはマシン全体）のスタートアップ項目です".into())) }
+        }
+        StopMethod::GracefulClose | StopMethod::ForceKill | StopMethod::LowerPriority => {
+            let all_mine = me.is_some() && !affected_pids.is_empty() && affected_pids.iter().all(|p| owner_of(*p).as_deref() == me);
+            if all_mine { Ok(()) } else { Err(Deny::NeedsAdmin("他のユーザーまたはシステムのプロセスを含みます".into())) }
+        }
+    }
+}
+
+/// 復元してよいか。管理者はすべて可。標準ユーザーは「自分が行った、自分の範囲の操作」だけ。
+pub fn can_undo(entry: &memopt_core::stop::JournalEntry, caller: &CallerInfo) -> bool {
+    use memopt_core::stop::Change;
+    if caller.is_admin {
+        return true;
+    }
+    let me = caller.user_sid.as_deref();
+    if me.is_none() || entry.actor_sid.as_deref() != me {
+        return false;
+    }
+    match &entry.change {
+        Change::StartupApproved { user_sid, .. } => user_sid.as_deref() == me,
+        Change::MemoryPriority { .. } => true,
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -360,5 +422,93 @@ mod tests {
         assert!(matches!(authorize(&p, StopMethod::ServiceStop, Some("B"), false), Err(Deny::Unavailable(_))));
         // 永続変更は確認フラグが無ければ通らない
         assert_eq!(authorize(&p, StopMethod::ServiceStartupDisabled, Some("A"), false), Err(Deny::NeedsConfirmation));
+    }
+
+    // ---- 呼び出し元の権限（標準ユーザーは自分のものだけ）----
+    const ME: &str = "S-1-5-21-1-2-3-1001";
+    const OTHER: &str = "S-1-5-21-1-2-3-1002";
+
+    fn std_user() -> CallerInfo {
+        CallerInfo { is_admin: false, user_sid: Some(ME.into()) }
+    }
+
+    fn owners<'a>(map: &'a [(u32, &'a str)]) -> impl Fn(u32) -> Option<String> + 'a {
+        move |pid| map.iter().find(|(p, _)| *p == pid).map(|(_, s)| s.to_string())
+    }
+
+    fn app_feature() -> Feature {
+        let mut f = feature(FeatureKind::DesktopApp, SafetyClass::Stoppable);
+        f.targets.startup.push(StartupRef { name: "Mine".into(), user_sid: Some(ME.into()) });
+        f.targets.startup.push(StartupRef { name: "Theirs".into(), user_sid: Some(OTHER.into()) });
+        f.targets.startup.push(StartupRef { name: "Machine".into(), user_sid: None });
+        f
+    }
+
+    #[test]
+    fn admin_may_do_everything() {
+        let admin = CallerInfo { is_admin: true, user_sid: None };
+        let f = app_feature();
+        for m in [StopMethod::ServiceStop, StopMethod::DisableTask, StopMethod::ForceKill, StopMethod::DisableStartup] {
+            assert!(authorize_caller(m, Some("Machine"), &f, &owners(&[]), &[1], &admin).is_ok(), "{m:?}");
+        }
+    }
+
+    #[test]
+    fn standard_user_cannot_touch_services_or_tasks_at_all() {
+        let f = app_feature();
+        for m in [StopMethod::ServiceStop, StopMethod::ServiceStartupManual, StopMethod::ServiceStartupDisabled, StopMethod::DisableTask] {
+            let r = authorize_caller(m, Some("x"), &f, &owners(&[(1, ME)]), &[1], &std_user());
+            assert!(matches!(r, Err(Deny::NeedsAdmin(_))), "{m:?}: {r:?}");
+        }
+    }
+
+    #[test]
+    fn standard_user_may_act_only_on_their_own_processes() {
+        let f = app_feature();
+        let own = owners(&[(1, ME), (2, ME)]);
+        for m in [StopMethod::GracefulClose, StopMethod::ForceKill, StopMethod::LowerPriority] {
+            assert!(authorize_caller(m, None, &f, &own, &[1, 2], &std_user()).is_ok(), "{m:?}");
+        }
+        // 1 つでも他人/システムのプロセスが混ざれば不可
+        let mixed = owners(&[(1, ME), (2, OTHER)]);
+        assert!(matches!(authorize_caller(StopMethod::ForceKill, None, &f, &mixed, &[1, 2], &std_user()), Err(Deny::NeedsAdmin(_))));
+        let sys = owners(&[(1, "S-1-5-18")]);
+        assert!(authorize_caller(StopMethod::GracefulClose, None, &f, &sys, &[1], &std_user()).is_err());
+        // 所有者が分からない / 対象が空 / 身元不明は不可（安全側）
+        assert!(authorize_caller(StopMethod::ForceKill, None, &f, &owners(&[]), &[9], &std_user()).is_err());
+        assert!(authorize_caller(StopMethod::ForceKill, None, &f, &own, &[], &std_user()).is_err());
+        assert!(authorize_caller(StopMethod::ForceKill, None, &f, &own, &[1], &CallerInfo::default()).is_err());
+    }
+
+    #[test]
+    fn standard_user_may_disable_only_their_own_startup_entries() {
+        let f = app_feature();
+        let none = owners(&[]);
+        assert!(authorize_caller(StopMethod::DisableStartup, Some("Mine"), &f, &none, &[], &std_user()).is_ok());
+        for t in ["Theirs", "Machine", "Unknown"] {
+            assert!(matches!(authorize_caller(StopMethod::DisableStartup, Some(t), &f, &none, &[], &std_user()), Err(Deny::NeedsAdmin(_))), "{t}");
+        }
+        assert!(authorize_caller(StopMethod::DisableStartup, None, &f, &none, &[], &std_user()).is_err());
+        assert!(authorize_caller(StopMethod::DisableStartup, Some("Mine"), &f, &none, &[], &CallerInfo::default()).is_err());
+    }
+
+    #[test]
+    fn undo_is_limited_to_the_callers_own_user_scope_changes() {
+        use memopt_core::stop::{Change, JournalEntry, Outcome};
+        let mk = |actor: Option<&str>, change: Change| JournalEntry {
+            id: 1, ts_unix: 0, feature_id: "f".into(), feature_name: "F".into(), method: StopMethod::DisableStartup, target: None,
+            change, outcome: Outcome::Ok, avail_before: None, avail_after: None, undone_ts: None, actor_sid: actor.map(str::to_string),
+        };
+        let mine = Change::StartupApproved { user_sid: Some(ME.into()), value_name: "x".into(), before_raw: None };
+        let theirs = Change::StartupApproved { user_sid: Some(OTHER.into()), value_name: "x".into(), before_raw: None };
+        let machine = Change::StartupApproved { user_sid: None, value_name: "x".into(), before_raw: None };
+        assert!(can_undo(&mk(Some(ME), mine.clone()), &std_user()));
+        assert!(!can_undo(&mk(Some(OTHER), mine), &std_user())); // 他人が行った記録
+        assert!(!can_undo(&mk(Some(ME), theirs), &std_user())); // 他人の領域の変更
+        assert!(!can_undo(&mk(Some(ME), machine), &std_user())); // HKLM
+        assert!(!can_undo(&mk(Some(ME), Change::ServiceStopped { name: "s".into(), dependents: vec![] }), &std_user()));
+        assert!(!can_undo(&mk(None, Change::MemoryPriority { items: vec![] }), &std_user())); // 記録者不明
+        assert!(can_undo(&mk(Some(ME), Change::MemoryPriority { items: vec![] }), &std_user()));
+        assert!(can_undo(&mk(Some(OTHER), Change::ServiceStopped { name: "s".into(), dependents: vec![] }), &CallerInfo { is_admin: true, user_sid: None }));
     }
 }

@@ -1,4 +1,5 @@
 //! サービスの共有状態。ロックは短く保ち、await をまたいで保持しない。
+use crate::sync::{LockExt};
 use crate::loadring::LoadRing;
 use memopt_actions::journal::Journal;
 use memopt_actions::task::TaskInfo;
@@ -78,14 +79,14 @@ impl Shared {
 
     /// 新しい報告があるときだけ返す。
     pub fn fresh_session(&self) -> Option<SessionInfo> {
-        let g = self.session.lock().unwrap();
+        let g = self.session.lock_ok();
         g.as_ref()
             .filter(|(_, at)| at.elapsed().as_secs() <= SESSION_STALE_SECS)
             .map(|(s, _)| s.clone())
     }
 
     pub fn is_paused(&self) -> bool {
-        let mut g = self.paused_until.lock().unwrap();
+        let mut g = self.paused_until.lock_ok();
         match *g {
             Some(t) if Instant::now() < t => true,
             Some(_) => {
@@ -97,7 +98,7 @@ impl Shared {
     }
 
     pub fn set_paused(&self, secs: u64) {
-        *self.paused_until.lock().unwrap() =
+        *self.paused_until.lock_ok() =
             (secs > 0).then(|| Instant::now() + std::time::Duration::from_secs(secs.min(MAX_PAUSE_SECS)));
     }
 }

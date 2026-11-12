@@ -1,4 +1,5 @@
 //! 解放の実行（直列に 1 件ずつ）。実行前/直後/60 秒後を history.db に記録する。
+use crate::sync::{LockExt, RwLockExt};
 use crate::state::Shared;
 use memopt_cleaner::CleanReport;
 use memopt_core::ipc::{Frame, Msg, RunSummary};
@@ -62,10 +63,10 @@ fn filetime_now() -> u64 {
 
 /// L1 の対象を選ぶ。トレイの報告が新しければ最前面/オーディオを除外する。
 fn l1_targets(shared: &Shared, procs: &[memopt_core::ProcessInfo]) -> (Vec<u32>, Option<String>) {
-    let cfg = shared.cfg.read().unwrap().clone();
+    let cfg = shared.cfg.read_ok().clone();
     let session = shared.fresh_session();
     let busy: HashSet<u32> = {
-        let h = shared.cpu_hist.lock().unwrap();
+        let h = shared.cpu_hist.lock_ok();
         match (h.front(), h.back()) {
             (Some(a), Some(b)) if h.len() >= 2 => {
                 let window = b.0.duration_since(a.0).as_secs().max(1);
@@ -93,7 +94,7 @@ fn l1_targets(shared: &Shared, procs: &[memopt_core::ProcessInfo]) -> (Vec<u32>,
 /// ブロッキング実行（spawn_blocking から呼ぶ）。
 pub fn execute(shared: &Shared, req: &RunRequest) -> Result<Executed, String> {
     let start_t = shared.now_secs();
-    let load_before = shared.loads.lock().unwrap().avg_load(start_t.saturating_sub(60), start_t);
+    let load_before = shared.loads.lock_ok().avg_load(start_t.saturating_sub(60), start_t);
     let before = mem_sample();
 
     let mut reports: Vec<CleanReport> = Vec::new();
@@ -159,14 +160,14 @@ async fn post_measure(shared: Arc<Shared>, notify: broadcast::Sender<Frame>, tri
 /// `wait` 後に測定する（テストでは短くできるよう分けてある）。
 async fn post_measure_after(shared: Arc<Shared>, notify: broadcast::Sender<Frame>, trigger: Trigger, ex: Executed, wait: Duration) {
     tokio::time::sleep(wait).await;
-    let load = shared.loads.lock().unwrap().avg_load(ex.end_t, ex.end_t + POST_MEASURE_SECS + 5).unwrap_or_default();
+    let load = shared.loads.lock_ok().avg_load(ex.end_t, ex.end_t + POST_MEASURE_SECS + 5).unwrap_or_default();
     let mem = tokio::task::spawn_blocking(mem_sample).await.unwrap_or_default();
     let id = ex.summary.id;
-    if let Err(e) = shared.store.lock().unwrap().update_after60(id, &mem, &load) {
+    if let Err(e) = shared.store.lock_ok().update_after60(id, &mem, &load) {
         tracing::warn!("60 秒後の測定を保存できません: {e}");
     }
     // ハードフォルトが測れていないとき（PDH 不可）は、逆効果の判定をしない（効果の大小だけ判定する）。
-    let measured = shared.loads.lock().unwrap().avg_load(ex.end_t, ex.end_t + POST_MEASURE_SECS + 5).is_some();
+    let measured = shared.loads.lock_ok().avg_load(ex.end_t, ex.end_t + POST_MEASURE_SECS + 5).is_some();
     let total_phys = memopt_probe::memory_snapshot().map_or(0, |m| m.total_phys);
     let eval = Evaluation {
         trigger,
@@ -176,14 +177,14 @@ async fn post_measure_after(shared: Arc<Shared>, notify: broadcast::Sender<Frame
         load_before: ex.load_before,
         load_after: measured.then_some(load),
     };
-    let adjustments = shared.engine.lock().unwrap().record_result(shared.now_secs(), &eval);
+    let adjustments = shared.engine.lock_ok().record_result(shared.now_secs(), &eval);
     if adjustments.is_empty() {
         return;
     }
     // 「なぜ控えめにしたか」を履歴に残し、画面へ通知する。
     let reason = adjustments.iter().map(|a| a.reason.clone()).collect::<Vec<_>>().join(" / ");
     tracing::warn!("自動調整: {reason}");
-    if let Err(e) = shared.store.lock().unwrap().set_note(id, &reason) {
+    if let Err(e) = shared.store.lock_ok().set_note(id, &reason) {
         tracing::warn!("自動調整の理由を保存できません: {e}");
     }
     let _ = notify.send(Frame::new(None, Msg::AdaptiveNotice { reason }));
@@ -255,7 +256,7 @@ mod tests {
             before: m(100, Some(500)), after: m(2000, Some(400)), load_before: None, after60: None, load_after60: None,
             report_json: "[]".into(), note: None,
         };
-        let id = shared.store.lock().unwrap().insert_run(&rec).unwrap();
+        let id = shared.store.lock_ok().insert_run(&rec).unwrap();
         let summary = RunSummary {
             id, ts_unix: 0, level: level as u8, trigger: trigger.as_str().into(), avail_before: 0, avail_after: 0,
             standby_before: None, standby_after: None, avail_after60: None, note: None,
@@ -267,7 +268,7 @@ mod tests {
     }
 
     fn push_load(shared: &Shared, t: u64, pages: f64) {
-        shared.loads.lock().unwrap().push(Sample {
+        shared.loads.lock_ok().push(Sample {
             t, load: LoadSample { pages_input_per_sec: pages, disk_read_bytes_per_sec: 0.0 }, disk_busy_pct: None,
         });
     }
@@ -282,14 +283,14 @@ mod tests {
         push_load(&shared, 25, 900.0);
         post_measure_after(shared.clone(), tx, Trigger::LowMemory, ex, Duration::from_millis(5)).await;
 
-        let note = shared.store.lock().unwrap().list_runs(1).unwrap()[0].note.clone().expect("理由が履歴に残る");
+        let note = shared.store.lock_ok().list_runs(1).unwrap()[0].note.clone().expect("理由が履歴に残る");
         assert!(note.contains("ハードフォルト") && note.contains("L1 までに制限"), "{note}");
         let Msg::AdaptiveNotice { reason } = rx.try_recv().unwrap().msg else { panic!("通知が来る") };
         assert_eq!(reason, note);
-        let notes = shared.engine.lock().unwrap().adaptive_notes(shared.now_secs());
+        let notes = shared.engine.lock_ok().adaptive_notes(shared.now_secs());
         assert!(notes.iter().any(|n| n.contains("低メモリ通知") && n.contains("L1 まで")), "{notes:?}");
         // 60 秒後の測定値も保存されている
-        assert!(shared.store.lock().unwrap().list_runs(1).unwrap()[0].load_after60.is_some());
+        assert!(shared.store.lock_ok().list_runs(1).unwrap()[0].load_after60.is_some());
     }
 
     #[tokio::test]
@@ -299,9 +300,9 @@ mod tests {
         let ex = executed(&shared, Trigger::Pressure, Level::L1, 100.0);
         push_load(&shared, 10, 90.0);
         post_measure_after(shared.clone(), tx, Trigger::Pressure, ex, Duration::from_millis(5)).await;
-        assert_eq!(shared.store.lock().unwrap().list_runs(1).unwrap()[0].note, None);
+        assert_eq!(shared.store.lock_ok().list_runs(1).unwrap()[0].note, None);
         assert!(rx.try_recv().is_err());
-        assert!(shared.engine.lock().unwrap().adaptive_notes(shared.now_secs()).is_empty());
+        assert!(shared.engine.lock_ok().adaptive_notes(shared.now_secs()).is_empty());
     }
 
     #[tokio::test]
@@ -312,7 +313,7 @@ mod tests {
         push_load(&shared, 10, 5000.0);
         post_measure_after(shared.clone(), tx, Trigger::Manual, ex, Duration::from_millis(5)).await;
         assert!(rx.try_recv().is_err());
-        assert!(shared.engine.lock().unwrap().adaptive_notes(shared.now_secs()).is_empty());
+        assert!(shared.engine.lock_ok().adaptive_notes(shared.now_secs()).is_empty());
     }
 
     #[tokio::test]

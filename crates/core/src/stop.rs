@@ -132,6 +132,9 @@ pub struct JournalEntry {
     /// 復元済みなら復元時刻。
     #[serde(default)]
     pub undone_ts: Option<i64>,
+    /// 操作を要求したユーザーの SID（パイプの接続元から OS が取った値）。標準ユーザーは自分の記録だけを見て、戻せる。
+    #[serde(default)]
+    pub actor_sid: Option<String>,
 }
 
 impl JournalEntry {
@@ -164,7 +167,7 @@ mod tests {
     fn entry(method: StopMethod, change: Change, outcome: Outcome) -> JournalEntry {
         JournalEntry {
             id: 1, ts_unix: 0, feature_id: "f".into(), feature_name: "F".into(), method, target: None, change,
-            outcome, avail_before: None, avail_after: None, undone_ts: None,
+            outcome, avail_before: None, avail_after: None, undone_ts: None, actor_sid: None,
         }
     }
 

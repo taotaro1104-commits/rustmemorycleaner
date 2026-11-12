@@ -118,7 +118,7 @@ mod tests {
     fn entry(outcome: Outcome) -> JournalEntry {
         JournalEntry {
             id: 1, ts_unix: 0, feature_id: "f".into(), feature_name: "Chrome".into(), method: StopMethod::ForceKill, target: None,
-            change: Change::None, outcome, avail_before: Some(100 << 20), avail_after: Some(300 << 20), undone_ts: None,
+            change: Change::None, outcome, avail_before: Some(100 << 20), avail_after: Some(300 << 20), undone_ts: None, actor_sid: None,
         }
     }
 

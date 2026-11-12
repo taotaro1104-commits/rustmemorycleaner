@@ -9,4 +9,5 @@ pub mod loadring;
 pub mod paths;
 pub mod runner;
 pub mod stopsvc;
+pub mod sync;
 pub mod state;

@@ -1,6 +1,6 @@
 //! 停止手段の実行と復元（Undo）。実行はサービス側。認可（authorize）を通った手段だけを渡すこと。
 use crate::journal::Journal;
-use crate::plan::{SERVICE_AUTO, SERVICE_DEMAND, SERVICE_DISABLED};
+use crate::plan::{can_undo, CallerInfo, SERVICE_AUTO, SERVICE_DEMAND, SERVICE_DISABLED};
 use crate::{proc, startup, svc, task};
 use memopt_core::stop::*;
 use memopt_core::{Feature, ProcessInfo};
@@ -13,6 +13,10 @@ pub struct Ctx<'a> {
     pub now_unix: i64,
     pub now_filetime: u64,
     pub avail_before: Option<u64>,
+    /// ユーザー保護リスト（強制終了の子孫に保護対象がいないか再確認するため）。
+    pub user_protected: &'a [String],
+    /// 要求したユーザーの SID（ジャーナルに記録する）。
+    pub actor_sid: Option<String>,
 }
 
 fn base(ctx: &Ctx, feature: &Feature, opt: &MethodOption) -> JournalEntry {
@@ -28,6 +32,7 @@ fn base(ctx: &Ctx, feature: &Feature, opt: &MethodOption) -> JournalEntry {
         avail_before: ctx.avail_before,
         avail_after: None,
         undone_ts: None,
+        actor_sid: ctx.actor_sid.clone(),
     }
 }
 
@@ -35,11 +40,25 @@ fn need_target(opt: &MethodOption) -> Result<&str, String> {
     opt.target.as_deref().ok_or_else(|| "対象が指定されていません".to_string())
 }
 
-/// 強制終了の対象: 機能の PID と、その子孫（プロセスツリー）。起動時刻つきで返す。
-fn kill_targets(feature: &Feature, procs: &[ProcessInfo]) -> Vec<(u32, u64)> {
+/// 強制終了の対象 PID: 機能の PID と、その子孫（プロセスツリー）。
+pub fn kill_pids(feature: &Feature, procs: &[ProcessInfo]) -> Vec<u32> {
     let mut pids = feature.pids.clone();
     pids.extend(proc::descendants(procs, &feature.pids));
-    pids.into_iter().filter_map(|pid| procs.iter().find(|p| p.pid == pid).map(|p| (pid, p.start_time))).collect()
+    pids
+}
+
+/// 強制終了の対象（起動時刻つき）。機能自体は計画の段階で保護分類を通っているが、子孫は別のプロセスなので、
+/// 1 つでも保護対象（組み込み・ユーザー保護・保護プロセス・本ツール）が含まれていたら全体を中止する。
+fn kill_targets(feature: &Feature, procs: &[ProcessInfo], user_protected: &[String]) -> Result<Vec<(u32, u64)>, String> {
+    let pids = kill_pids(feature, procs);
+    let infos: Vec<&ProcessInfo> = pids.iter().filter_map(|pid| procs.iter().find(|p| p.pid == *pid)).collect();
+    if let Some(p) = infos.iter().find(|p| {
+        !feature.pids.contains(&p.pid)
+            && (p.is_ppl || p.exe_name.to_ascii_lowercase().starts_with("memopt-") || memopt_grouping::is_protected(p, user_protected))
+    }) {
+        return Err(format!("子孫プロセス {} が保護対象のため、強制終了を中止しました", p.exe_name));
+    }
+    Ok(infos.iter().map(|p| (p.pid, p.start_time)).collect())
 }
 
 /// 1 件を実行してジャーナルに追記し、記録した内容を返す。失敗も記録する（outcome = Failed）。
@@ -52,9 +71,10 @@ pub fn execute(ctx: &Ctx, feature: &Feature, procs: &[ProcessInfo], opt: &Method
             Ok(Change::None)
         }
         StopMethod::ForceKill => {
-            let targets = kill_targets(feature, procs);
-            let fails: Vec<String> = targets.iter().filter_map(|(pid, st)| proc::kill_verified(*pid, *st).err()).collect();
-            if fails.is_empty() { Ok(Change::None) } else { Err(fails.join(" / ")) }
+            kill_targets(feature, procs, ctx.user_protected).and_then(|targets| {
+                let fails: Vec<String> = targets.iter().filter_map(|(pid, st)| proc::kill_verified(*pid, *st).err()).collect();
+                if fails.is_empty() { Ok(Change::None) } else { Err(fails.join(" / ")) }
+            })
         }
         StopMethod::ServiceStop => need_target(opt)
             .and_then(|n| svc::stop(n, SERVICE_WAIT).map(|dependents| Change::ServiceStopped { name: n.to_string(), dependents })),
@@ -74,7 +94,8 @@ pub fn execute(ctx: &Ctx, feature: &Feature, procs: &[ProcessInfo], opt: &Method
         }),
         StopMethod::LowerPriority => {
             let (mut items, mut fails) = (Vec::new(), Vec::new());
-            for (pid, st) in kill_targets(feature, procs).into_iter().filter(|(p, _)| feature.pids.contains(p)) {
+            let own: Vec<(u32, u64)> = procs.iter().filter(|p| feature.pids.contains(&p.pid)).map(|p| (p.pid, p.start_time)).collect();
+            for (pid, st) in own {
                 match proc::lower_priority(pid, st) {
                     Ok(before) => items.push(PriorityItem { pid, start_time: st, before }),
                     Err(m) => fails.push(m),
@@ -130,16 +151,30 @@ pub fn undo(journal: &Journal, id: u64, now_unix: i64) -> Result<(), String> {
     journal.mark_undone(id, now_unix).map_err(|e| format!("復元は成功しましたが記録に失敗: {e}"))
 }
 
+/// 呼び出し元の権限で復元する（標準ユーザーは自分が行った自分の範囲の操作だけ）。
+pub fn undo_as(journal: &Journal, id: u64, now_unix: i64, caller: &CallerInfo) -> Result<(), String> {
+    let entry = journal.load().into_iter().find(|e| e.id == id).ok_or("その記録はありません")?;
+    if !can_undo(&entry, caller) {
+        return Err("この操作を元に戻す権限がありません（管理者権限、または自分が行った操作のみ）".into());
+    }
+    undo(journal, id, now_unix)
+}
+
 #[derive(Debug, Default, PartialEq)]
 pub struct UndoReport {
     pub restored: Vec<u64>,
     pub failed: Vec<(u64, String)>,
 }
 
-/// 復元できるものを新しい順にすべて戻す（途中で失敗しても残りは続行）。
+/// 復元できるものを新しい順にすべて戻す（途中で失敗しても残りは続行）。管理者相当の操作（CLI・サービス内部）用。
 pub fn undo_all(journal: &Journal, now_unix: i64) -> UndoReport {
+    undo_all_as(journal, now_unix, &CallerInfo { is_admin: true, user_sid: None })
+}
+
+/// `caller` が戻してよいものだけを新しい順に戻す。
+pub fn undo_all_as(journal: &Journal, now_unix: i64, caller: &CallerInfo) -> UndoReport {
     let mut r = UndoReport::default();
-    let mut todo: Vec<_> = journal.load().into_iter().filter(JournalEntry::undoable).collect();
+    let mut todo: Vec<_> = journal.load().into_iter().filter(JournalEntry::undoable).filter(|e| can_undo(e, caller)).collect();
     todo.sort_by_key(|e| std::cmp::Reverse(e.id));
     for e in todo {
         match undo(journal, e.id, now_unix) {
@@ -176,7 +211,7 @@ mod tests {
     }
 
     fn ctx(j: &Journal) -> Ctx<'_> {
-        Ctx { journal: j, now_unix: 1000, now_filetime: 0x01D0_0000_0000_0000, avail_before: Some(7) }
+        Ctx { journal: j, now_unix: 1000, now_filetime: 0x01D0_0000_0000_0000, avail_before: Some(7), user_protected: &[], actor_sid: Some("S-1-5-21-9".into()) }
     }
 
     fn wide(s: &str) -> Vec<u16> {
@@ -280,7 +315,7 @@ mod tests {
         let j = tmp_journal("undoall");
         let mk = |id: u64, change: Change, method: StopMethod| JournalEntry {
             id, ts_unix: 0, feature_id: "f".into(), feature_name: "F".into(), method, target: None, change,
-            outcome: Outcome::Ok, avail_before: None, avail_after: None, undone_ts: None,
+            outcome: Outcome::Ok, avail_before: None, avail_after: None, undone_ts: None, actor_sid: None,
         };
         // 1: 存在しないタスク（復元に失敗する）、2: 優先度（常に成功扱い）、3: 元に戻せない操作（対象外）
         j.append_entry(&mk(1, Change::TaskEnabled { path: r"\MemOpt\Nope".into(), before_enabled: true }, StopMethod::DisableTask)).unwrap();
@@ -293,5 +328,54 @@ mod tests {
         let after = j.load();
         assert_eq!(after.iter().find(|e| e.id == 2).unwrap().undone_ts, Some(9));
         assert_eq!(after.iter().find(|e| e.id == 1).unwrap().undone_ts, None); // 失敗したものは未復元のまま残る
+    }
+
+    #[test]
+    fn force_kill_is_refused_when_a_descendant_is_protected_and_kills_nothing() {
+        let procs = vec![
+            ProcessInfo { pid: 10, parent_pid: 1, start_time: 100, exe_name: "app.exe".into(), exe_path: Some(r"C:\a\app.exe".into()), ..Default::default() },
+            // 子孫: 保護プロセス（PPL）
+            ProcessInfo { pid: 11, parent_pid: 10, start_time: 200, exe_name: "helper.exe".into(), exe_path: Some(r"C:\a\helper.exe".into()), is_ppl: true, ..Default::default() },
+        ];
+        let f = feature(vec![10]);
+        let j = tmp_journal("protdesc");
+        let e = execute(&ctx(&j), &f, &procs, &opt(StopMethod::ForceKill, None)).unwrap();
+        assert!(matches!(&e.outcome, Outcome::Failed(m) if m.contains("保護対象")), "{:?}", e.outcome);
+        // 子孫がユーザー保護リストに載っている場合も同様
+        let procs2 = vec![
+            procs[0].clone(),
+            ProcessInfo { is_ppl: false, ..procs[1].clone() },
+        ];
+        let user = vec![r"C:\a\helper.exe".to_string()];
+        let c2 = Ctx { user_protected: &user, ..ctx(&j) };
+        let e2 = execute(&c2, &f, &procs2, &opt(StopMethod::ForceKill, None)).unwrap();
+        assert!(matches!(e2.outcome, Outcome::Failed(_)));
+    }
+
+    #[test]
+    fn the_actor_is_recorded_in_the_journal() {
+        let j = tmp_journal("actor");
+        let e = execute(&ctx(&j), &feature(vec![1]), &[], &opt(StopMethod::GracefulClose, None)).unwrap();
+        assert_eq!(e.actor_sid.as_deref(), Some("S-1-5-21-9"));
+        assert_eq!(j.load()[0].actor_sid.as_deref(), Some("S-1-5-21-9"));
+    }
+
+    #[test]
+    fn undo_as_refuses_other_users_entries_and_undo_all_as_skips_them() {
+        let j = tmp_journal("undoas");
+        let mk = |id: u64, actor: &str| JournalEntry {
+            id, ts_unix: 0, feature_id: "f".into(), feature_name: "F".into(), method: StopMethod::LowerPriority, target: None,
+            change: Change::MemoryPriority { items: vec![] }, outcome: Outcome::Ok, avail_before: None, avail_after: None,
+            undone_ts: None, actor_sid: Some(actor.into()),
+        };
+        j.append_entry(&mk(1, "S-1-5-21-ME")).unwrap();
+        j.append_entry(&mk(2, "S-1-5-21-OTHER")).unwrap();
+        let me = CallerInfo { is_admin: false, user_sid: Some("S-1-5-21-ME".into()) };
+        assert!(undo_as(&j, 2, 5, &me).unwrap_err().contains("権限がありません"));
+        let r = undo_all_as(&j, 6, &me);
+        assert_eq!(r.restored, vec![1]);
+        let after = j.load();
+        assert_eq!(after.iter().find(|e| e.id == 2).unwrap().undone_ts, None); // 他人の分は触らない
+        assert!(undo_as(&j, 2, 7, &CallerInfo { is_admin: true, user_sid: None }).is_ok());
     }
 }

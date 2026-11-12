@@ -100,7 +100,7 @@ mod tests {
     fn entry(id: u64, method: StopMethod, change: Change) -> JournalEntry {
         JournalEntry {
             id, ts_unix: 100 + id as i64, feature_id: format!("f{id}"), feature_name: "F".into(), method, target: None,
-            change, outcome: Outcome::Ok, avail_before: Some(10), avail_after: None, undone_ts: None,
+            change, outcome: Outcome::Ok, avail_before: Some(10), avail_after: None, undone_ts: None, actor_sid: None,
         }
     }
 

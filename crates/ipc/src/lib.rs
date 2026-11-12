@@ -1,5 +1,21 @@
 //! 名前付きパイプ IPC（設計書2章）。1 行 1 メッセージの JSON。
 //! サーバーは「対話ユーザーと Administrators（+SYSTEM）」のみ接続可の DACL を付けて作る。
+/// パイプの接続元の身元（接続時にサーバーが取得する）。要求の内容ではなく、OS が保証する値。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Caller {
+    /// 昇格済みの管理者トークンか（UAC で分離された非昇格トークンは false）。
+    pub is_admin: bool,
+    /// 呼び出し元ユーザーの SID。取得できなければ None（その場合は「自分のもの」の判定がすべて不成立になる）。
+    pub user_sid: Option<String>,
+}
+
+impl Caller {
+    /// 身元が分からない接続。最も権限の低い扱いにする。
+    pub fn unknown() -> Self {
+        Self::default()
+    }
+}
+
 #[cfg(windows)]
 mod client;
 #[cfg(windows)]
@@ -11,6 +27,8 @@ mod server;
 pub use client::{Client, ClientError};
 #[cfg(windows)]
 pub use server::{BoxFut, Handler, Server};
+#[cfg(windows)]
+pub use security::current_process_user_sid;
 
 /// ブロッキングしない 1 行読み取り。上限を超えたら Err(TooLong) 相当で切断する。
 #[cfg(windows)]

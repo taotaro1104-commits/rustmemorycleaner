@@ -14,7 +14,7 @@ mod win;
 #[cfg(windows)]
 pub use startup::startup_entries;
 #[cfg(windows)]
-pub use win::{all_cpu_times, memory_snapshot, nt_process_table, processes, NtProc};
+pub use win::{process_owner_sid, all_cpu_times, memory_snapshot, nt_process_table, processes, NtProc};
 #[cfg(windows)]
 pub use pdh::Pdh;
 #[cfg(windows)]
