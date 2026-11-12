@@ -51,6 +51,12 @@ function Assert([bool]$cond, [string]$msg) { if (-not $cond) { throw $msg } }
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) { throw "管理者として実行した PowerShell が必要です" }
 if (-not (Test-Path $Msi)) { throw "MSI がありません: $Msi（先に installer\build.ps1 を実行してください）" }
+# msiexec はインストールをサーバー側で行うため、相対パスのままだと開けない（エラー 1619）。絶対パスにしておく。
+$Msi = (Resolve-Path $Msi).Path
+if ($UpgradeMsi) {
+    if (-not (Test-Path $UpgradeMsi)) { throw "アップグレード用の MSI がありません: $UpgradeMsi" }
+    $UpgradeMsi = (Resolve-Path $UpgradeMsi).Path
+}
 if (Get-Service $svcName -ErrorAction SilentlyContinue) { throw "$svcName が既にインストールされています。既存環境を壊さないため中止します（検証は VM で行ってください）" }
 if (Test-Path "\\.\pipe\$pipeName") { throw "パイプ $pipeName が既に存在します（memopt-service が動作中？）。停止してから実行してください" }
 New-Item -ItemType Directory -Force $logDir | Out-Null
@@ -70,6 +76,16 @@ function Wait-State([string]$want, [int]$timeoutSec) {
     return $false
 }
 function Svc-Pid { (Get-CimInstance Win32_Service -Filter "Name='$svcName'").ProcessId }
+# 強制終了のあと、SCM が再起動したサービスの新しい PID（旧 PID と異なり、かつ Running）を待つ。
+function Wait-NewPid([int]$old, [int]$timeoutSec) {
+    $end = (Get-Date).AddSeconds($timeoutSec)
+    while ((Get-Date) -lt $end) {
+        $p = Svc-Pid
+        if ($p -gt 0 -and $p -ne $old -and (Get-Service $svcName).Status.ToString() -eq "Running") { return $p }
+        Start-Sleep -Milliseconds 700
+    }
+    return 0
+}
 function Pipe-Snapshot {
     $p = New-Object System.IO.Pipes.NamedPipeClientStream(".", $pipeName, [System.IO.Pipes.PipeDirection]::InOut)
     try {
@@ -120,11 +136,14 @@ try {
         $acl = Get-Acl $dataDir
         Assert ($acl.AreAccessRulesProtected) "継承が切られていない"
         $rules = $acl.Access | ForEach-Object { "{0}:{1}" -f $_.IdentityReference.Value, $_.FileSystemRights }
-        Assert (($acl.Access | Where-Object { $_.IdentityReference.Value -match "SYSTEM" -and $_.FileSystemRights -match "FullControl" })) "SYSTEM が全権でない: $rules"
-        Assert (($acl.Access | Where-Object { $_.IdentityReference.Value -match "Administrators" -and $_.FileSystemRights -match "FullControl" })) "Administrators が全権でない: $rules"
-        $users = $acl.Access | Where-Object { $_.IdentityReference.Value -match "\\Users$" }
-        Assert ($users) "Users の規則が無い: $rules"
-        Assert (-not ($users | Where-Object { $_.FileSystemRights -match "Write|Modify|FullControl|CreateFiles|AppendData" })) "Users に書き込み権限がある: $($users.FileSystemRights)"
+        $sysRules = @($acl.Access | Where-Object { $_.IdentityReference.Value -match "SYSTEM" -and $_.FileSystemRights -match "FullControl" })
+        $admRules = @($acl.Access | Where-Object { $_.IdentityReference.Value -match "Administrators" -and $_.FileSystemRights -match "FullControl" })
+        Assert ($sysRules.Count -gt 0) "SYSTEM が全権でない: $rules"
+        Assert ($admRules.Count -gt 0) "Administrators が全権でない: $rules"
+        $users = @($acl.Access | Where-Object { $_.IdentityReference.Value -match "\\Users$" })
+        Assert ($users.Count -gt 0) "Users の規則が無い: $rules"
+        $writers = @($users | Where-Object { $_.FileSystemRights -match "Write|Modify|FullControl|CreateFiles|AppendData" })
+        Assert ($writers.Count -eq 0) "Users に書き込み権限がある: $(($users | ForEach-Object { $_.FileSystemRights }) -join ',')"
         "ok"
     }
 
@@ -144,15 +163,18 @@ try {
         Check "1 回目の異常終了: 約 60 秒後に自動で再起動される" {
             $old = Svc-Pid; Assert ($old -gt 0) "PID が取れない"
             Stop-Process -Id $old -Force
-            Assert (Wait-State "Running" 120) "120 秒以内に再起動しなかった（状態: $((Get-Service $svcName).Status)）"
-            $new = Svc-Pid; Assert ($new -gt 0 -and $new -ne $old) "PID が変わっていない"
-            "PID $old → $new"
+            $new = Wait-NewPid $old 120
+            Assert ($new -gt 0) "120 秒以内に新しいプロセスで再起動しなかった（状態: $((Get-Service $svcName).Status)）"
+            "PID $old → $new（約 60 秒後に再起動）"
         }
         Check "2 回目の異常終了: 再起動されず停止のまま" {
-            $old = Svc-Pid; Stop-Process -Id $old -Force
-            Start-Sleep -Seconds 75
+            $old = Svc-Pid
+            Assert ($old -gt 0) "1 回目の後にサービスが動いていない（2 回目の前提が成り立たない）"
+            Stop-Process -Id $old -Force
+            Start-Sleep -Seconds 75   # 1 回目の再起動待ち(60 秒)より長く待つ
             $st = (Get-Service $svcName).Status.ToString()
             Assert ($st -eq "Stopped") "停止のままでない（状態: $st）"
+            Assert ((Svc-Pid) -eq 0) "プロセスが復活している（PID $(Svc-Pid)）"
             "Stopped"
         }
         Start-Service $svcName -ErrorAction SilentlyContinue   # 以降の確認のために手動で起動
