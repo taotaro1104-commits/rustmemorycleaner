@@ -39,6 +39,9 @@
       <Directory Id="ProgramFiles64Folder">
         <Directory Id="INSTALLFOLDER" Name="MemOpt" />
       </Directory>
+      <Directory Id="ProgramMenuFolder">
+        <Directory Id="AppMenuFolder" Name="MemOpt" />
+      </Directory>
     </Directory>
 
     <DirectoryRef Id="INSTALLFOLDER">
@@ -78,6 +81,22 @@
       </Component>
     </DirectoryRef>
 
+    <!-- スタートメニュー（プログラム一覧）: ダッシュボードとトレイ常駐の 2 つ。全ユーザー向け。 -->
+    <DirectoryRef Id="AppMenuFolder">
+      <Component Id="StartMenuShortcuts" Guid="5A9E2D71-B3C4-4F08-8D16-7E0C4A92F5B8" Win64="yes">
+        <Shortcut Id="DashboardShortcut" Name="MemOpt ダッシュボード"
+                  Description="メモリの使用状況を機能ごとに表示します"
+                  Target="[INSTALLFOLDER]memopt-tray.exe" Arguments="--window"
+                  WorkingDirectory="INSTALLFOLDER" />
+        <Shortcut Id="TrayShortcut" Name="MemOpt（タスクトレイに常駐）"
+                  Description="タスクトレイにアイコンを表示して常駐します"
+                  Target="[INSTALLFOLDER]memopt-tray.exe"
+                  WorkingDirectory="INSTALLFOLDER" />
+        <RemoveFolder Id="RemoveAppMenuFolder" On="uninstall" />
+        <RegistryValue Root="HKCU" Key="Software\MemOpt" Name="StartMenuShortcuts" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
     <!--
       アンインストール前の確認: 未復元の永続変更があれば復元を提案する。
       対話 UI のときだけダイアログを出し、サイレント(/qn)では何も変更しない（一覧を表示するだけ）。
@@ -96,6 +115,7 @@
       <ComponentRef Id="TrayExe" />
       <ComponentRef Id="TrayAutostart" />
       <ComponentRef Id="CliExe" />
+      <ComponentRef Id="StartMenuShortcuts" />
     </Feature>
   </Product>
 </Wix>
