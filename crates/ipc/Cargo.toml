@@ -1,0 +1,17 @@
+[package]
+name = "memopt-ipc"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+memopt-core = { path = "../core" }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "sync", "macros", "time"] }
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.58"
+features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_System_Memory",
+]

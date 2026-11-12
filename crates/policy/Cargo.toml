@@ -1,0 +1,8 @@
+[package]
+name = "memopt-policy"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+memopt-core = { path = "../core" }
+memopt-grouping = { path = "../grouping" }

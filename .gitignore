@@ -1,0 +1,6 @@
+target/
+*.db
+dist/
+*.msi
+*.zip
+*.pfx

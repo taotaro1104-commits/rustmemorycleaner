@@ -1,0 +1,7 @@
+[package]
+name = "memopt-grouping"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+memopt-core = { path = "../core" }

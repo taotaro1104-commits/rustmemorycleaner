@@ -1,0 +1,33 @@
+[package]
+name = "memopt-service"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "memopt_service"
+path = "src/lib.rs"
+
+[[bin]]
+name = "memopt-service"
+path = "src/main.rs"
+
+[dependencies]
+memopt-core = { path = "../../crates/core" }
+memopt-probe = { path = "../../crates/probe" }
+memopt-grouping = { path = "../../crates/grouping" }
+memopt-policy = { path = "../../crates/policy" }
+memopt-cleaner = { path = "../../crates/cleaner" }
+memopt-store = { path = "../../crates/store" }
+memopt-ipc = { path = "../../crates/ipc" }
+memopt-actions = { path = "../../crates/actions" }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "signal"] }
+serde_json.workspace = true
+toml.workspace = true
+windows-service = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
+tracing-appender = "0.2"
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.58"
+features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization"]

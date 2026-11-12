@@ -1,0 +1,101 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  MemOpt インストーラー（WiX Toolset v3）。
+  ビルド: installer\build.ps1（WixUtilExtension を使用: サービスの回復設定のため）。
+
+  設計書6章:
+  - サービスは LocalSystem・自動起動。回復設定は「1 回目の失敗で 60 秒後に再起動、2 回目以降は停止のまま」。
+  - トレイはログオン時に自動起動（全ユーザー）。
+  - アンインストール前に、未復元の永続変更があれば復元を提案する（対話時のみ。サイレントでは何も変更しない）。
+  - 設定・ジャーナル・履歴は %ProgramData%\MemOpt に残す（復元に必要なため削除しない）。
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi"
+     xmlns:util="http://schemas.microsoft.com/wix/UtilExtension">
+
+  <?ifndef Version ?>
+    <?define Version = "0.1.0" ?>
+  <?endif?>
+  <?ifndef BinDir ?>
+    <?define BinDir = "..\target\release" ?>
+  <?endif?>
+
+  <Product Id="*"
+           Name="MemOpt"
+           Language="1041" Codepage="932"
+           Version="$(var.Version)"
+           Manufacturer="MemOpt"
+           UpgradeCode="8D7C1F34-5B0A-4E6F-9C2D-3A1E7B4F6A90">
+
+    <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine"
+             Description="常駐メモリ最適化ツール" />
+
+    <MajorUpgrade DowngradeErrorMessage="より新しいバージョンの MemOpt がすでにインストールされています。" />
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- 64 ビット OS のみ対応（Windows 10/11 x64）。 -->
+    <Condition Message="MemOpt は 64 ビット版 Windows 10/11 が必要です。">VersionNT64 &gt;= 603</Condition>
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLFOLDER" Name="MemOpt" />
+      </Directory>
+    </Directory>
+
+    <DirectoryRef Id="INSTALLFOLDER">
+      <!-- サービス本体 -->
+      <Component Id="ServiceExe" Guid="3F2A9C10-7E54-4B8D-A6C1-0D9E5B7F1A21" Win64="yes">
+        <File Id="ServiceExeFile" Name="memopt-service.exe" Source="$(var.BinDir)\memopt-service.exe" KeyPath="yes" />
+        <ServiceInstall Id="MemOptService"
+                        Name="MemOptService"
+                        DisplayName="MemOpt メモリ最適化サービス"
+                        Description="メモリ圧迫を検知したときだけ段階的に解放し、効果を測定します。"
+                        Type="ownProcess" Start="auto" ErrorControl="normal"
+                        Account="LocalSystem" Vital="yes" />
+        <ServiceControl Id="MemOptServiceControl" Name="MemOptService"
+                        Start="install" Stop="both" Remove="uninstall" Wait="yes" />
+        <!-- 回復: 1 回目の失敗で 60 秒後に再起動、2 回目以降は何もしない。24 時間で失敗回数をリセット。 -->
+        <util:ServiceConfig ServiceName="MemOptService"
+                            FirstFailureActionType="restart"
+                            SecondFailureActionType="none"
+                            ThirdFailureActionType="none"
+                            RestartServiceDelayInSeconds="60"
+                            ResetPeriodInDays="1" />
+      </Component>
+
+      <!-- トレイ（ダッシュボードは同じ exe を別プロセスで起動） -->
+      <Component Id="TrayExe" Guid="9B6D4E88-2C17-4F3A-8E05-61A7C3D2B9F4" Win64="yes">
+        <File Id="TrayExeFile" Name="memopt-tray.exe" Source="$(var.BinDir)\memopt-tray.exe" KeyPath="yes" />
+      </Component>
+      <!-- ログオン時にトレイを自動起動（全ユーザー）。一般ユーザー権限で動く。 -->
+      <Component Id="TrayAutostart" Guid="C41E7A52-9D08-4B6C-B3F7-5E2A80D1C6E3" Win64="yes">
+        <RegistryValue Root="HKLM" Key="Software\Microsoft\Windows\CurrentVersion\Run"
+                       Name="MemOpt" Type="string" Value="&quot;[INSTALLFOLDER]memopt-tray.exe&quot;" KeyPath="yes" />
+      </Component>
+
+      <!-- CLI（復元・診断・手動解放）。PATH には追加しない。 -->
+      <Component Id="CliExe" Guid="E7A3B915-4D62-48C0-9F1B-2C8D6A5E0B37" Win64="yes">
+        <File Id="CliExeFile" Name="memopt-cli.exe" Source="$(var.BinDir)\memopt-cli.exe" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <!--
+      アンインストール前の確認: 未復元の永続変更があれば復元を提案する。
+      対話 UI のときだけダイアログを出し、サイレント(/qn)では何も変更しない（一覧を表示するだけ）。
+      失敗してもアンインストール自体は続行する（Return="ignore"）。
+    -->
+    <CustomAction Id="PromptRestoreChanges"
+                  FileKey="CliExeFile"
+                  ExeCommand="uninstall-prompt --ui-level [UILevel]"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+    <InstallExecuteSequence>
+      <Custom Action="PromptRestoreChanges" Before="StopServices">REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE</Custom>
+    </InstallExecuteSequence>
+
+    <Feature Id="Main" Title="MemOpt" Level="1" ConfigurableDirectory="INSTALLFOLDER">
+      <ComponentRef Id="ServiceExe" />
+      <ComponentRef Id="TrayExe" />
+      <ComponentRef Id="TrayAutostart" />
+      <ComponentRef Id="CliExe" />
+    </Feature>
+  </Product>
+</Wix>

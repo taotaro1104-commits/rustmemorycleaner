@@ -1,0 +1,29 @@
+[package]
+name = "memopt-actions"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+memopt-core = { path = "../core" }
+memopt-grouping = { path = "../grouping" }
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+memopt-probe = { path = "../probe" }
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.58"
+features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_System_Threading",
+  "Win32_System_Services",
+  "Win32_System_Registry",
+  "Win32_System_Com",
+  "Win32_System_Variant",
+  "Win32_System_Ole",
+  "Win32_System_TaskScheduler",
+  "Win32_System_Environment",
+]
