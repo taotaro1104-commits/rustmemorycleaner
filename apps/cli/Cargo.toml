@@ -15,7 +15,7 @@ memopt-cleaner = { path = "../../crates/cleaner" }
 memopt-store = { path = "../../crates/store" }
 memopt-actions = { path = "../../crates/actions" }
 memopt-grouping = { path = "../../crates/grouping" }
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 serde_json.workspace = true
 windows-service = "0.7"
 
